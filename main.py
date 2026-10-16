@@ -1,5 +1,6 @@
 import math
 import pygame
+import asyncio
 
 # Simulador gravitatorio v6.9 - Newton + retardo configurable + masas fijas + isobandas de intensidad
 WIN_W, WIN_H = 1200, 800
@@ -461,7 +462,7 @@ def solar_button(screen,font):
     screen.blit(label,label.get_rect(center=SOLAR_BUTTON.center))
 
 
-def main():
+async def main():
     global W,H
     pygame.init();screen=pygame.display.set_mode((WIN_W,WIN_H));pygame.display.set_caption('Simulador gravitatorio v6.9')
     clock=pygame.time.Clock();font=pygame.font.SysFont('consolas',18);small=pygame.font.SysFont('consolas',14);title=pygame.font.SysFont('consolas',20,True)
@@ -720,6 +721,9 @@ def main():
         if mx>PANEL:
             wx,wy=cam.to_world(mx,my);text(screen,small,f'({wx:.2f}, {wy:.2f})',mx+12,my+12)
         pygame.display.flip()
+
+        await asyncio.sleep(0)
     pygame.quit()
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    asyncio.run(main())
