@@ -1,10 +1,19 @@
 import math
-import pygame
 import asyncio
+import sys
+import pygame
 
-# Simulador gravitatorio v6.9 - Newton + retardo configurable + masas fijas + isobandas de intensidad
+# Simulador gravitatorio v7.0 - escritorio + web/pygbag optimizado
 WIN_W, WIN_H = 1200, 800
 W, H, PANEL, FPS = WIN_W, WIN_H, 330, 60
+IS_WEB = sys.platform == "emscripten"
+WEB_FIELD_UPDATE_EVERY = 6
+DESKTOP_FIELD_UPDATE_EVERY = 2
+WEB_INTENSITY_STEP = 20
+DESKTOP_INTENSITY_STEP = 10
+WEB_VECTOR_STEP = 30
+DESKTOP_VECTOR_STEP = 20
+ENERGY_UPDATE_EVERY = 6 if IS_WEB else 2
 BG=(12,15,25); PC=(27,31,45); TXT=(235,235,240); MUT=(155,165,185)
 BLUE=(70,135,255); RED=(245,70,80); YEL=(255,210,80); GREEN=(105,220,160)
 CYAN=(70,240,255); AXIS=(65,70,90); TRAIL=(80,100,150); BORDER=(90,95,115)
@@ -73,7 +82,15 @@ class Body:
         x,y=cam.to_screen(self.x,self.y); p=(int(x),int(y)); r=min(100,max(2,int(self.r*math.sqrt(cam.zoom))))
         if trails and len(self.trail)>1:
             trail_color=(135,155,210) if getattr(self,'kinematic_moon',False) else TRAIL
-            pygame.draw.lines(s,trail_color,False,[tuple(map(int,cam.to_screen(*q))) for q in self.trail],1)
+            trail_data=self.trail
+            # En WASM limitar la cantidad de vertices renderizados mantiene la
+            # misma forma visual sin transformar miles de puntos por cuerpo.
+            if IS_WEB and len(trail_data)>500:
+                stride=max(1,math.ceil(len(trail_data)/500))
+                trail_data=trail_data[::stride]
+                if trail_data[-1] is not self.trail[-1]:
+                    trail_data=trail_data+[self.trail[-1]]
+            pygame.draw.lines(s,trail_color,False,[tuple(map(int,cam.to_screen(*q))) for q in trail_data],1)
         c=BLUE if self.m>0 else RED; pygame.draw.circle(s,c,p,r); pygame.draw.circle(s,TXT,p,r,2)
         if self.fixed:
             pygame.draw.circle(s,YEL,p,r+4,2)
@@ -181,9 +198,9 @@ def hit_body(bodies,pos,cam):
         x,y=cam.to_screen(b.x,b.y);r=max(7,int(b.r*math.sqrt(cam.zoom)))
         if (pos[0]-x)**2+(pos[1]-y)**2<=r*r:return b
 
-def draw_field_vectors(s,cam,sources,g,c,t,instant):
-    for sy in range(10,H,20):
-        for sx in range(PANEL+10,W,20):
+def draw_field_vectors(s,cam,sources,g,c,t,instant,step=20):
+    for sy in range(10,H,step):
+        for sx in range(PANEL+10,W,step):
             wx,wy=cam.to_world(sx,sy);fx,fy=field(wx,wy,sources,g,c,t,instant);m=math.hypot(fx,fy)
             if m<1e-12:continue
             L=4+math.tanh(m/80)*22;vx,vy=fx/m*L,-fy/m*L
@@ -209,9 +226,8 @@ FIELD_PALETTE = [
     (197,48,120),(157,53,166)
 ]
 
-def draw_intensity_bands(s,cam,sources,g,c,t,instant):
+def draw_intensity_bands(s,cam,sources,g,c,t,instant,step=10):
     """Isobandas discretas de |a|, con escala logaritmica adaptativa."""
-    step=10
     xs=list(range(PANEL,W,step)); ys=list(range(0,H,step))
     values=[]
     for sy in ys:
@@ -263,7 +279,8 @@ def predict_trajectory(x,y,vx,vy,mass,radius,bodies,sources,g,c,t,instant,collis
     prediction_time=float(t)
     start_screen=cam.to_screen(px,py)
 
-    for step in range(PREDICTION_STEPS):
+    prediction_steps = 360 if IS_WEB else PREDICTION_STEPS
+    for step in range(prediction_steps):
         ax,ay=field(px,py,sources,g,c,prediction_time,instant)
         pvx+=ax*PREDICTION_DT
         pvy+=ay*PREDICTION_DT
@@ -387,7 +404,8 @@ def place_moons(bodies,t):
         if (not b.trail or
             math.hypot(b.x-b.trail[-1][0],b.y-b.trail[-1][1])>=min_step):
             b.trail.append((b.x,b.y))
-        if len(b.trail)>3000:
+        moon_trail_limit=1400 if IS_WEB else 3000
+        if len(b.trail)>moon_trail_limit:
             b.trail.pop(0)
 
 def append_moons(bodies):
@@ -453,8 +471,7 @@ def draw_solar_orbits(screen, cam, bodies):
     screen.set_clip(old_clip)
 
 
-def solar_button(screen,font):
-    mouse=pygame.mouse.get_pos()
+def solar_button(screen,font,mouse):
     hover=SOLAR_BUTTON.collidepoint(mouse)
     pygame.draw.rect(screen,(48,104,150) if hover else (42,75,113),SOLAR_BUTTON,border_radius=5)
     pygame.draw.rect(screen,(100,180,230),SOLAR_BUTTON,2,border_radius=5)
@@ -462,9 +479,56 @@ def solar_button(screen,font):
     screen.blit(label,label.get_rect(center=SOLAR_BUTTON.center))
 
 
+def create_display(fullscreen=False):
+    """Crea solo la ventana/canvas fisico.
+
+    La simulacion NO dibuja directamente aqui. Todo se renderiza primero en
+    LOGICAL_W x LOGICAL_H y luego se escala manualmente. Esto evita depender
+    de pygame.SCALED, cuyo remapeo de mouse puede quedar desincronizado en
+    pygbag/navegadores.
+    """
+    if fullscreen:
+        return pygame.display.set_mode((0,0), pygame.FULLSCREEN)
+    return pygame.display.set_mode((WIN_W,WIN_H), pygame.RESIZABLE)
+
+
+def viewport_for(display_surface):
+    """Rectangulo del canvas logico dentro de la ventana, conservando aspecto."""
+    dw,dh=display_surface.get_size()
+    if dw<=0 or dh<=0:
+        return pygame.Rect(0,0,WIN_W,WIN_H),1.0
+    scale=min(dw/WIN_W,dh/WIN_H)
+    vw=max(1,int(round(WIN_W*scale)))
+    vh=max(1,int(round(WIN_H*scale)))
+    vx=(dw-vw)//2
+    vy=(dh-vh)//2
+    return pygame.Rect(vx,vy,vw,vh),scale
+
+
+def physical_to_logical(pos,display_surface):
+    """Convierte coordenadas reales del canvas a las 1200x800 de la UI."""
+    view,scale=viewport_for(display_surface)
+    if scale<=0:
+        return (0,0)
+    x=(pos[0]-view.x)/scale
+    y=(pos[1]-view.y)/scale
+    return (clamp(x,0,WIN_W-1),clamp(y,0,WIN_H-1))
+
+
+def present_logical(display_surface,logical_surface):
+    """Escala el frame logico al canvas fisico con letterboxing."""
+    view,_=viewport_for(display_surface)
+    display_surface.fill((0,0,0))
+    if view.size==(WIN_W,WIN_H):
+        display_surface.blit(logical_surface,view.topleft)
+    else:
+        scaled=pygame.transform.scale(logical_surface,view.size)
+        display_surface.blit(scaled,view.topleft)
+    pygame.display.flip()
+
+
 async def main():
-    global W,H
-    pygame.init();screen=pygame.display.set_mode((WIN_W,WIN_H));pygame.display.set_caption('Simulador gravitatorio v6.9')
+    pygame.init();display=create_display(False);screen=pygame.Surface((WIN_W,WIN_H));pygame.display.set_caption('Simulador gravitatorio v7.1')
     clock=pygame.time.Clock();font=pygame.font.SysFont('consolas',18);small=pygame.font.SysFont('consolas',14);title=pygame.font.SysFont('consolas',20,True)
     cam=Camera();bodies=[];sources=[];selected=tracked=None;run=True;sim=False
     trails=cm=vectors=collisions=True;instant=True;full=False;fieldmode=0;g=G0;c=C0;t=0.
@@ -472,10 +536,19 @@ async def main():
     energy_reference=None;energy_signature=None;solar_mode=False
     sling_active=False; sling_start_screen=None; sling_current_screen=None; sling_start_world=None
     g_slider_max=GMAX
+    frame_index=0
+    field_cache=None
+    field_cache_mode=None
+    field_cache_due=True
+    field_update_every=WEB_FIELD_UPDATE_EVERY if IS_WEB else DESKTOP_FIELD_UPDATE_EVERY
+    intensity_step=WEB_INTENSITY_STEP if IS_WEB else DESKTOP_INTENSITY_STEP
+    vector_step=WEB_VECTOR_STEP if IS_WEB else DESKTOP_VECTOR_STEP
+    energy_cache=(0.0,0.0,0.0,0.0)
+    energy_cache_signature=None
     def activate_solar():
         nonlocal bodies,sources,selected,tracked,sim,t,g,instant,collisions,solar_mode
         nonlocal mass,vx,vy,energy_reference,energy_signature,sling_active
-        nonlocal sling_start_screen,sling_current_screen,sling_start_world,g_slider_max
+        nonlocal sling_start_screen,sling_current_screen,sling_start_world,g_slider_max,field_cache_due
         bodies=load_solar_system();sources=[b for b in bodies if not getattr(b,'kinematic_moon',False)]
         selected=tracked=None;sim=False;t=0.0
         g=SOLAR_G;g_slider_max=max(GMAX,math.ceil(SOLAR_G/1000)*1000)
@@ -484,8 +557,10 @@ async def main():
         mass,vx,vy='1000','0','0'
         energy_reference=None;energy_signature=None
         sling_active=False;sling_start_screen=sling_current_screen=sling_start_world=None
+        field_cache_due=True
     while run:
         frame=clock.tick(FPS)/1000
+        frame_index += 1
         for e in pygame.event.get():
             if e.type==pygame.QUIT:run=False
             elif e.type==pygame.KEYDOWN:
@@ -495,7 +570,7 @@ async def main():
                 elif e.key==pygame.K_p:activate_solar()
                 elif e.key==pygame.K_SPACE:sim=not sim
                 elif e.key==pygame.K_v:vectors=not vectors
-                elif e.key==pygame.K_f:fieldmode=(fieldmode+1)%3
+                elif e.key==pygame.K_f:fieldmode=(fieldmode+1)%3;field_cache_due=True
                 elif e.key==pygame.K_t:trails=not trails
                 elif e.key==pygame.K_m:cm=not cm
                 elif e.key==pygame.K_h:tracked=None;cam.reset()
@@ -526,15 +601,15 @@ async def main():
                     elif active==1:vx+=e.unicode
                     else:vy+=e.unicode
             elif e.type==pygame.MOUSEBUTTONDOWN:
-                p=e.pos
+                p=physical_to_logical(e.pos,display)
                 if e.button==1:
                     if SOLAR_BUTTON.collidepoint(p):activate_solar()
-                    elif G_RECT.inflate(10,34).collidepoint(p):drag_g=True;g=sval(p[0],G_RECT,GMIN,g_slider_max)
-                    elif C_RECT.inflate(10,30).collidepoint(p):drag_c=True;c=sval(p[0],C_RECT,CMIN,CMAX,True)
-                    elif CHECK_INSTANT.inflate(290,8).collidepoint(p):instant=not instant;energy_reference=None
+                    elif G_RECT.inflate(10,34).collidepoint(p):drag_g=True;g=sval(p[0],G_RECT,GMIN,g_slider_max);field_cache_due=True
+                    elif C_RECT.inflate(10,30).collidepoint(p):drag_c=True;c=sval(p[0],C_RECT,CMIN,CMAX,True);field_cache_due=True
+                    elif CHECK_INSTANT.inflate(290,8).collidepoint(p):instant=not instant;energy_reference=None;field_cache_due=True
                     elif CHECK_COLL.inflate(290,8).collidepoint(p):collisions=not collisions
                     elif CHECK_FULL.inflate(290,8).collidepoint(p):
-                        full=not full;screen=pygame.display.set_mode((0,0),pygame.FULLSCREEN) if full else pygame.display.set_mode((WIN_W,WIN_H));W,H=screen.get_size()
+                        full=not full;display=create_display(full);field_cache_due=True
                     elif p[0]>PANEL:
                         b=hit_body(bodies,p,cam)
                         if b:
@@ -566,7 +641,7 @@ async def main():
                 if e.button==1:
                     drag_g=drag_c=False
                     if sling_active:
-                        sling_current_screen=e.pos
+                        sling_current_screen=physical_to_logical(e.pos,display)
                         drag_distance=math.hypot(
                             sling_current_screen[0]-sling_start_screen[0],
                             sling_current_screen[1]-sling_start_screen[1]
@@ -588,20 +663,26 @@ async def main():
                         sling_active=False;sling_start_screen=None;sling_current_screen=None;sling_start_world=None
                 elif e.button==2:drag_cam=False
             elif e.type==pygame.MOUSEMOTION:
-                if drag_g:g=sval(e.pos[0],G_RECT,GMIN,g_slider_max)
-                if drag_c:c=sval(e.pos[0],C_RECT,CMIN,CMAX,True)
-                
-                if sling_active:sling_current_screen=e.pos
-                if drag_cam:cam.pan(e.pos[0]-last[0],e.pos[1]-last[1]);last=e.pos
-            elif e.type==pygame.MOUSEWHEEL and pygame.mouse.get_pos()[0]>PANEL:cam.zoom_at(pygame.mouse.get_pos(),1.15**e.y)
+                mp=physical_to_logical(e.pos,display)
+                if drag_g:g=sval(mp[0],G_RECT,GMIN,g_slider_max);field_cache_due=True
+                if drag_c:c=sval(mp[0],C_RECT,CMIN,CMAX,True);field_cache_due=True
+                if sling_active:sling_current_screen=mp
+                if drag_cam:cam.pan(mp[0]-last[0],mp[1]-last[1]);last=mp;field_cache_due=True
+            elif e.type==pygame.MOUSEWHEEL:
+                mp=physical_to_logical(pygame.mouse.get_pos(),display)
+                if mp[0]>PANEL:
+                    cam.zoom_at(mp,1.15**e.y);field_cache_due=True
         keys=pygame.key.get_pressed();pan=500*frame
         if not tracked:
-            if keys[pygame.K_a] or keys[pygame.K_LEFT]:cam.pan(pan,0)
-            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:cam.pan(-pan,0)
-            if keys[pygame.K_w] or keys[pygame.K_UP]:cam.pan(0,pan)
-            if keys[pygame.K_s] or keys[pygame.K_DOWN]:cam.pan(0,-pan)
+            if keys[pygame.K_a] or keys[pygame.K_LEFT]:cam.pan(pan,0);field_cache_due=True
+            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:cam.pan(-pan,0);field_cache_due=True
+            if keys[pygame.K_w] or keys[pygame.K_UP]:cam.pan(0,pan);field_cache_due=True
+            if keys[pygame.K_s] or keys[pygame.K_DOWN]:cam.pan(0,-pan);field_cache_due=True
         if sim and (bodies or sources):
-            dt=(SOLAR_DT if solar_mode else DT)/SUB
+            # En el preset solar 60 s reales ~= 1 ano incluso si WebAssembly cae de 60 FPS.
+            # Se limita frame para evitar saltos enormes al volver de una pestaña suspendida.
+            sim_frame_dt=min(frame,0.05) if solar_mode else DT
+            dt=sim_frame_dt/SUB
             for _ in range(SUB):
                 t=verlet_step([b for b in bodies if not getattr(b,'kinematic_moon',False)],sources,g,c,t,dt,instant)
                 if solar_mode:place_moons(bodies,t)
@@ -613,8 +694,19 @@ async def main():
         ox,oy=cam.to_screen(0,0)
         if 0<=oy<=H:pygame.draw.line(screen,AXIS,(PANEL,int(oy)),(W,int(oy)))
         if PANEL<=ox<=W:pygame.draw.line(screen,AXIS,(int(ox),0),(int(ox),H))
-        if fieldmode==1:draw_field_vectors(screen,cam,sources,g,c,t,instant)
-        elif fieldmode==2:draw_intensity_bands(screen,cam,sources,g,c,t,instant)
+        if fieldmode:
+            if (field_cache is None or field_cache_mode!=fieldmode or field_cache_due
+                    or frame_index % field_update_every == 0):
+                field_cache=pygame.Surface((W,H),pygame.SRCALPHA)
+                if fieldmode==1:
+                    draw_field_vectors(field_cache,cam,sources,g,c,t,instant,vector_step)
+                else:
+                    draw_intensity_bands(field_cache,cam,sources,g,c,t,instant,intensity_step)
+                field_cache_mode=fieldmode
+                field_cache_due=False
+            screen.blit(field_cache,(0,0))
+        else:
+            field_cache=None;field_cache_mode=None
         if solar_mode:draw_solar_orbits(screen,cam,bodies)
         for b in bodies:
             is_moon=getattr(b,'kinematic_moon',False)
@@ -689,7 +781,7 @@ async def main():
             if abs(mt)>EPS:
                 cx=sum(b.m*b.x for b in bodies)/mt;cy=sum(b.m*b.y for b in bodies)/mt;sx,sy=map(int,cam.to_screen(cx,cy));pygame.draw.circle(screen,CYAN,(sx,sy),12,2)
         pygame.draw.rect(screen,PC,(0,0,PANEL,H));pygame.draw.line(screen,BORDER,(PANEL,0),(PANEL,H),2)
-        text(screen,title,'SIMULADOR GRAVITATORIO V6.9',15,15);text(screen,font,'Estado: EJECUCION' if sim else 'Estado: PAUSA',15,48,(90,255,140) if sim else (255,190,80))
+        text(screen,title,'SIMULADOR GRAVITATORIO V7.1',15,15);text(screen,font,'Estado: EJECUCION' if sim else 'Estado: PAUSA',15,48,(90,255,140) if sim else (255,190,80))
         for i,(lab,val) in enumerate((('Masa',mass),('Velocidad X',vx),('Velocidad Y',vy))):text(screen,font,('> ' if i==active else '  ')+f'{lab}: {val}',15,80+i*32,(100,255,140) if i==active else TXT)
         slider(screen,small,G_RECT,'G',f'{g:.4f}',clamp(g/g_slider_max,0,1),'0',f'{g_slider_max:g}')
         cr=(math.log10(c)-math.log10(CMIN))/(math.log10(CMAX)-math.log10(CMIN))
@@ -701,12 +793,16 @@ async def main():
         for line in lines:text(screen,small,line,15,yy,GREEN if line.startswith('F:') else TXT);yy+=17
         text(screen,small,f'Cuerpos: {len(bodies)} (lunas: {sum(getattr(b,"kinematic_moon",False) for b in bodies)})',15,570);text(screen,small,f'Tiempo: {t:.2f} s' + (f' | {t/60:.3f} anos' if solar_mode else ''),15,590);text(screen,small,f'Seguimiento: {"SI" if tracked else "NO"}',15,610)
         # Valores absolutos siempre visibles; error solo en tramos conservativos.
-        ek,ep,et=energy_components([b for b in bodies if not getattr(b,'kinematic_moon',False)],g)
         signature=(tuple((b.id,b.m,b.fixed) for b in bodies if not getattr(b,'kinematic_moon',False)),g,collisions,instant,c if not instant else None)
-        if signature!=energy_signature or energy_reference is None:
-            energy_reference=et
-        energy_signature=signature
-        error=100*(et-energy_reference)/max(abs(energy_reference),1e-12)
+        if signature!=energy_signature or energy_reference is None or frame_index % ENERGY_UPDATE_EVERY == 0:
+            ek,ep,et=energy_components([b for b in bodies if not getattr(b,'kinematic_moon',False)],g)
+            if signature!=energy_signature or energy_reference is None:
+                energy_reference=et
+            error=100*(et-energy_reference)/max(abs(energy_reference),1e-12)
+            energy_cache=(ek,ep,et,error)
+            energy_signature=signature
+        else:
+            ek,ep,et,error=energy_cache
         text(screen,small,f'E cinetica:  {ek:.6g}',15,640)
         text(screen,small,f'E potencial: {ep:.6g}',15,660)
         text(screen,small,f'E total:     {et:.6g}',15,680)
@@ -715,15 +811,17 @@ async def main():
         else:
             text(screen,small,'Delta E: n/a (retardo/colision)',15,700,MUT)
         text(screen,small,('Solar: 1 UA=10000 | 1 ano=60 s' if solar_mode else 'Unidades internas del simulador'),15,727,MUT)
-        text(screen,small,'Fijas: restriccion externa',15,747,MUT)
-        solar_button(screen,small)
-        mx,my=pygame.mouse.get_pos()
+        text(screen,small,'Fijas: restriccion externa' + (' | WEB optimizado' if IS_WEB else ''),15,747,MUT)
+        logical_mouse=physical_to_logical(pygame.mouse.get_pos(),display)
+        solar_button(screen,small,logical_mouse)
+        mx,my=logical_mouse
         if mx>PANEL:
             wx,wy=cam.to_world(mx,my);text(screen,small,f'({wx:.2f}, {wy:.2f})',mx+12,my+12)
-        pygame.display.flip()
-
+        present_logical(display,screen)
+        # Obligatorio en pygbag: devuelve control al navegador en cada frame.
         await asyncio.sleep(0)
-    pygame.quit()
+    if not IS_WEB:
+        pygame.quit()
 
 if __name__=='__main__':
     asyncio.run(main())
